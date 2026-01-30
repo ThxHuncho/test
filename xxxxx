@@ -1,38 +1,39 @@
-# Complete example USING run_swing_pricing_optimization exactly as requested
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ============================
-# 0. Simulated data
-# ============================
-np.random.seed(42)
-T = 500
+# ============================================================
+# 0. INPUT DATA (ASSUMED GIVEN)
+# ============================================================
+# r     : pd.Series of returns
+# flow  : pd.Series of flows = (subs - red) / AUM
+# VL0   : float (initial NAV)
+# swing_factor : float (e.g. 0.002 = 20 bps)
 
-# Simulated returns
-r = pd.Series(np.random.normal(0.0003, 0.004, T))
-
-# Simulated flows (subs-red / AUM)
-flow = pd.Series(np.random.standard_t(df=3, size=T) * 0.01)
-
-VL0 = 100.0
-swing_factor = 0.002
-cost_coeff = 1.0
+assert len(r) == len(flow), "Returns and flows must have same length"
+T = len(r)
 
 # ============================================================
-# 1. NAV CONSTRUCTION
+# 1. NAV CONSTRUCTION (UNSWUNG)
 # ============================================================
 def compute_nav(returns, VL0):
+    """
+    Compute unswung NAV from returns
+    """
     nav = np.zeros(len(returns))
     nav[0] = VL0
     for t in range(1, len(returns)):
         nav[t] = nav[t-1] * (1 + returns.iloc[t])
     return nav
 
+
 # ============================================================
-# 3. SWING MECHANISM
+# 2. SWING MECHANISM
 # ============================================================
 def compute_swing_adjustment(flow_t, q, swing_factor):
+    """
+    Discrete swing rule
+    """
     if flow_t > q:
         return swing_factor
     elif flow_t < -q:
@@ -40,50 +41,85 @@ def compute_swing_adjustment(flow_t, q, swing_factor):
     else:
         return 0.0
 
+
 def compute_nav_swing(nav, flows, q, swing_factor):
+    """
+    Compute swing-adjusted NAV
+    """
     nav_s = np.zeros_like(nav)
     nav_s[0] = nav[0]
+
     for t in range(1, len(nav)):
-        swing = compute_swing_adjustment(flows.iloc[t], q, swing_factor)
-        nav_s[t] = nav[t] * (1 + swing)
+        adj = compute_swing_adjustment(flows.iloc[t], q, swing_factor)
+        nav_s[t] = nav[t] * (1 + adj)
+
     return nav_s
 
-# ============================================================
-# 4. SWING-INDUCED DILUTION
-# ============================================================
-def swing_dilution(flows, q, cost_coeff=1.0):
-    dilution = np.zeros(len(flows))
-    for t in range(len(flows)):
-        if abs(flows.iloc[t]) > q:
-            dilution[t] = cost_coeff * abs(flows.iloc[t])
-    return dilution
 
 # ============================================================
-# 5. NAV DISTORTION
+# 3. SWING-INDUCED DILUTION (YOUR DEFINITION)
+# ============================================================
+def swing_dilution(flows, q, swing_factor):
+    """
+    Dilution imputée aux investisseurs swingés :
+    D_t = s * |flow_t| si swing activé
+    """
+    dilution = np.zeros(len(flows))
+
+    for t in range(len(flows)):
+        if abs(flows.iloc[t]) > q:
+            dilution[t] = swing_factor * abs(flows.iloc[t])
+        else:
+            dilution[t] = 0.0
+
+    return dilution
+
+
+# ============================================================
+# 4. NAV DISTORTION MEASURE
 # ============================================================
 def nav_distortion(nav, nav_swinged):
+    """
+    Distortion measured as volatility of log NAV difference
+    """
     diff = np.log(nav_swinged) - np.log(nav)
     return np.std(diff)
 
-# ============================================================
-# 6. EFFICIENCY RATIO
-# ============================================================
-def efficiency_ratio(q, nav, flows, swing_factor, cost_coeff=1.0, eps=1e-8):
-    nav_s = compute_nav_swing(nav, flows, q, swing_factor)
-    distortion = nav_distortion(nav, nav_s)
-    dilution = np.mean(swing_dilution(flows, q, cost_coeff))
-    return dilution / (distortion + eps)
 
 # ============================================================
-# 7. OPTIMIZATION (GRID)
+# 5. EFFICIENCY RATIO OBJECTIVE
 # ============================================================
-def optimize_threshold(nav, flows, swing_factor, cost_coeff=1.0,
-                       q_min=0.02, q_max=0.98, n_grid=60):
+def efficiency_ratio(q, nav, flows, swing_factor, eps=1e-8):
+    """
+    Efficiency ratio:
+    E[D_swing(q)] / E[Delta(q)]
+    """
+    nav_s = compute_nav_swing(nav, flows, q, swing_factor)
+    distortion = nav_distortion(nav, nav_s)
+    dilution = np.mean(swing_dilution(flows, q, swing_factor))
+
+    return dilution / (distortion + eps)
+
+
+# ============================================================
+# 6. OPTIMIZATION ON EMPIRICAL QUANTILES
+# ============================================================
+def optimize_threshold(
+    nav,
+    flows,
+    swing_factor,
+    q_min=0.02,
+    q_max=0.98,
+    n_grid=60
+):
+    """
+    Optimize threshold over empirical quantiles of |flows|
+    """
     abs_flows = np.abs(flows)
     q_grid = np.quantile(abs_flows, np.linspace(q_min, q_max, n_grid))
 
     scores = np.array([
-        efficiency_ratio(q, nav, flows, swing_factor, cost_coeff)
+        efficiency_ratio(q, nav, flows, swing_factor)
         for q in q_grid
     ])
 
@@ -96,44 +132,45 @@ def optimize_threshold(nav, flows, swing_factor, cost_coeff=1.0,
         "scores": scores
     }
 
+
 # ============================================================
-# 8. PIPELINE (AS REQUESTED)
+# 7. FULL PIPELINE (AS REQUESTED)
 # ============================================================
-def run_swing_pricing_optimization(r, flow, VL0, swing_factor, cost_coeff=1.0):
+def run_swing_pricing_optimization(r, flow, VL0, swing_factor):
     nav = compute_nav(r, VL0)
 
     results = optimize_threshold(
         nav=nav,
         flows=flow,
-        swing_factor=swing_factor,
-        cost_coeff=cost_coeff
+        swing_factor=swing_factor
     )
 
     return results
 
+
 # ============================================================
-# 9. RUN + PLOT
+# 8. EXAMPLE USAGE + PLOT
 # ============================================================
 results = run_swing_pricing_optimization(
     r=r,
     flow=flow,
     VL0=VL0,
-    swing_factor=swing_factor,
-    cost_coeff=cost_coeff
+    swing_factor=swing_factor
 )
 
 q_star = results["q_star"]
 scores = results["scores"]
 q_grid = results["q_grid"]
 
+print(f"Optimal threshold q* = {q_star:.4%}")
+print(f"Max efficiency ratio = {results['efficiency_max']:.4f}")
+
 plt.figure()
 plt.plot(q_grid, scores, label="Efficiency ratio")
 plt.axvline(q_star, linestyle="--", label=f"q* = {q_star:.2%}")
-plt.scatter([q_star], [scores.max()])
+plt.scatter([q_star], [results["efficiency_max"]])
 plt.xlabel("Swing threshold q")
 plt.ylabel("Efficiency ratio")
-plt.title("Swing Pricing Optimization (Efficiency Ratio)")
+plt.title("Swing Pricing Optimization — Efficiency Ratio")
 plt.legend()
 plt.show()
-
-results
