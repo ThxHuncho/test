@@ -11,19 +11,17 @@ import matplotlib.pyplot as plt
 # swing_factor : float (e.g. 0.002 = 20 bps)
 
 assert len(r) == len(flow), "Returns and flows must have same length"
+r = pd.Series(np.random.normal(0.0003, 0.004, T))
 T = len(r)
 
 # ============================================================
 # 1. NAV CONSTRUCTION (UNSWUNG)
 # ============================================================
 def compute_nav(returns, VL0):
-    """
-    Compute unswung NAV from returns
-    """
     nav = np.zeros(len(returns))
     nav[0] = VL0
     for t in range(1, len(returns)):
-        nav[t] = nav[t-1] * (1 + returns.iloc[t])
+        nav[t] = nav[t - 1] * (1 + returns.iloc[t])
     return nav
 
 
@@ -31,9 +29,6 @@ def compute_nav(returns, VL0):
 # 2. SWING MECHANISM
 # ============================================================
 def compute_swing_adjustment(flow_t, q, swing_factor):
-    """
-    Discrete swing rule
-    """
     if flow_t > q:
         return swing_factor
     elif flow_t < -q:
@@ -43,9 +38,6 @@ def compute_swing_adjustment(flow_t, q, swing_factor):
 
 
 def compute_nav_swing(nav, flows, q, swing_factor):
-    """
-    Compute swing-adjusted NAV
-    """
     nav_s = np.zeros_like(nav)
     nav_s[0] = nav[0]
 
@@ -61,116 +53,133 @@ def compute_nav_swing(nav, flows, q, swing_factor):
 # ============================================================
 def swing_dilution(flows, q, swing_factor):
     """
-    Dilution imputée aux investisseurs swingés :
-    D_t = s * |flow_t| si swing activé
+    D_t = s * |flow_t| if swing is activated
     """
-    dilution = np.zeros(len(flows))
+    abs_flows = np.abs(flows.values)
+    return swing_factor * abs_flows * (abs_flows > q)
 
-    for t in range(len(flows)):
-        if abs(flows.iloc[t]) > q:
-            dilution[t] = swing_factor * abs(flows.iloc[t])
-        else:
-            dilution[t] = 0.0
 
-    return dilution
+def expected_swing_dilution(flows, q, swing_factor):
+    return np.mean(swing_dilution(flows, q, swing_factor))
 
 
 # ============================================================
-# 4. NAV DISTORTION MEASURE
+# 4. NAV DISTORTION
 # ============================================================
 def nav_distortion(nav, nav_swinged):
-    """
-    Distortion measured as volatility of log NAV difference
-    """
     diff = np.log(nav_swinged) - np.log(nav)
     return np.std(diff)
 
 
-# ============================================================
-# 5. EFFICIENCY RATIO OBJECTIVE
-# ============================================================
-def efficiency_ratio(q, nav, flows, swing_factor, eps=1e-8):
-    """
-    Efficiency ratio:
-    E[D_swing(q)] / E[Delta(q)]
-    """
+def distortion_only(q, nav, flows, swing_factor):
     nav_s = compute_nav_swing(nav, flows, q, swing_factor)
-    distortion = nav_distortion(nav, nav_s)
-    dilution = np.mean(swing_dilution(flows, q, swing_factor))
-
-    return dilution / (distortion + eps)
+    return nav_distortion(nav, nav_s)
 
 
 # ============================================================
-# 6. OPTIMIZATION ON EMPIRICAL QUANTILES
+# 5. OPTIMIZATION WITH CONSTRAINT
 # ============================================================
-def optimize_threshold(
+def optimize_threshold_with_constraint(
     nav,
     flows,
     swing_factor,
+    D_min,
     q_min=0.02,
     q_max=0.98,
-    n_grid=60
+    n_grid=100
 ):
     """
-    Optimize threshold over empirical quantiles of |flows|
+    min_q  Δσ(q)
+    s.t.   E[D_swing(q)] >= D_min
     """
-    abs_flows = np.abs(flows)
+
+    abs_flows = np.abs(flows.values)
     q_grid = np.quantile(abs_flows, np.linspace(q_min, q_max, n_grid))
 
-    scores = np.array([
-        efficiency_ratio(q, nav, flows, swing_factor)
-        for q in q_grid
-    ])
+    feasible_q = []
+    distortions = []
+    dilutions = []
 
-    idx_star = np.argmax(scores)
+    for q in q_grid:
+        D_exp = np.mean(swing_factor * abs_flows * (abs_flows > q))
+        if D_exp >= D_min:
+            feasible_q.append(q)
+            distortions.append(distortion_only(q, nav, flows, swing_factor))
+            dilutions.append(D_exp)
+
+    if len(feasible_q) == 0:
+        raise ValueError(
+            f"No feasible threshold. D_min={D_min:.2e} exceeds "
+            f"max achievable dilution {np.mean(swing_factor * abs_flows):.2e}"
+        )
+
+    idx_star = np.argmin(distortions)
 
     return {
-        "q_star": q_grid[idx_star],
-        "efficiency_max": scores[idx_star],
-        "q_grid": q_grid,
-        "scores": scores
+        "q_star": feasible_q[idx_star],
+        "min_distortion": distortions[idx_star],
+        "dilution_at_q_star": dilutions[idx_star],
+        "q_feasible": feasible_q,
+        "distortions": distortions,
+        "dilutions": dilutions
     }
 
 
 # ============================================================
-# 7. FULL PIPELINE (AS REQUESTED)
+# 6. FULL PIPELINE (OPTION 2)
 # ============================================================
-def run_swing_pricing_optimization(r, flow, VL0, swing_factor):
+def run_swing_pricing_optimization_constrained(
+    r,
+    flow,
+    VL0,
+    swing_factor,
+    D_min
+):
     nav = compute_nav(r, VL0)
 
-    results = optimize_threshold(
+    results = optimize_threshold_with_constraint(
         nav=nav,
         flows=flow,
-        swing_factor=swing_factor
+        swing_factor=swing_factor,
+        D_min=D_min
     )
 
     return results
 
 
 # ============================================================
-# 8. EXAMPLE USAGE + PLOT
+# 7. SAFE USAGE (IMPORTANT)
 # ============================================================
-results = run_swing_pricing_optimization(
+# Maximum achievable dilution (q = 0)
+D_max = np.mean(swing_factor * np.abs(flow.values))
+
+# Choose a FEASIBLE constraint (e.g. 30% of max protection)
+D_min = 0.3 * D_max
+
+print(f"Max achievable dilution : {D_max:.2e}")
+print(f"Chosen D_min            : {D_min:.2e}")
+
+results = run_swing_pricing_optimization_constrained(
     r=r,
     flow=flow,
     VL0=VL0,
-    swing_factor=swing_factor
+    swing_factor=swing_factor,
+    D_min=D_min
 )
 
-q_star = results["q_star"]
-scores = results["scores"]
-q_grid = results["q_grid"]
+print(f"\nOptimal threshold q*      : {results['q_star']:.4%}")
+print(f"Minimum NAV distortion    : {results['min_distortion']:.6e}")
+print(f"E[D_swing(q*)]            : {results['dilution_at_q_star']:.6e}")
 
-print(f"Optimal threshold q* = {q_star:.4%}")
-print(f"Max efficiency ratio = {results['efficiency_max']:.4f}")
 
+# ============================================================
+# 8. PLOT (OPTIONAL BUT USEFUL)
+# ============================================================
 plt.figure()
-plt.plot(q_grid, scores, label="Efficiency ratio")
-plt.axvline(q_star, linestyle="--", label=f"q* = {q_star:.2%}")
-plt.scatter([q_star], [results["efficiency_max"]])
+plt.plot(results["q_feasible"], results["distortions"], label="NAV distortion")
+plt.axvline(results["q_star"], linestyle="--", label=f"q* = {results['q_star']:.2%}")
 plt.xlabel("Swing threshold q")
-plt.ylabel("Efficiency ratio")
-plt.title("Swing Pricing Optimization — Efficiency Ratio")
+plt.ylabel("NAV distortion")
+plt.title("Swing Pricing — Constrained Optimization")
 plt.legend()
 plt.show()
